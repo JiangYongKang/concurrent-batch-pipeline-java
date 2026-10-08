@@ -4,6 +4,7 @@ import com.github.highcumontoa.pipeline.store.IdempotencyStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
@@ -81,7 +82,8 @@ public class BatchPipelineEngine implements AutoCloseable {
                             RecordStatus.REJECTED, "invalid record: blank businessId", 0)));
         }
         String id = record.businessId();
-        if (!store.tryClaim(id)) {
+        IdempotencyStore.ClaimOutcome outcome = store.acquireClaim(id);
+        if (outcome != IdempotencyStore.ClaimOutcome.ACCEPTED) {
             Optional<RecordResult> existing = store.find(id);
             String reason = existing.map(r -> "duplicate: already confirmed as " + r.status())
                     .orElse("duplicate: submission already in-flight");
@@ -96,28 +98,56 @@ public class BatchPipelineEngine implements AutoCloseable {
             admitted = false;
         }
         if (!admitted || closing) {
+            // 尚未开始处理：回滚占位。该标识之后可凭同一 ID 重新提交，不被卡死，
+            // 内部占用也随之回收（仅在内存中存在过，不留持久化痕迹）。
+            store.rollbackClaim(id);
+            String reason = closing
+                    ? "rejected: engine shutting down"
+                    : "backpressure: no capacity within " + properties.getOfferTimeoutMs() + "ms";
             return completed(tally(RecordStatus.REJECTED,
-                    new RecordResult(id, RecordStatus.REJECTED,
-                            "backpressure: no capacity within " + properties.getOfferTimeoutMs() + "ms", 0)));
+                    new RecordResult(id, RecordStatus.REJECTED, reason, 0)));
         }
         CompletableFuture<RecordResult> future = new CompletableFuture<>();
         try {
             executor.execute(() -> {
                 try {
+                    // 业务副作用发生前先写"处理已开始"日志：处理途中被中断时，
+                    // 重启回放会把该标识识别为 INTERRUPTED，可重新受理，系统绝不伪造结论。
+                    store.persistAttemptStarted(id);
                     future.complete(processWithRetry(record));
+                } catch (UncheckedIOException e) {
+                    // 前置日志写不进盘：不能在无崩溃记录的情况下继续处理，置为中断未决。
+                    store.markInterrupted(id);
+                    future.complete(tally(RecordStatus.REJECTED,
+                            new RecordResult(id, RecordStatus.REJECTED,
+                                    "rejected: failed to record processing start: " + e.getMessage(), 0)));
                 } catch (Throwable t) {
-                    future.complete(tally(RecordStatus.FAILED_FATAL,
-                            new RecordResult(id, RecordStatus.FAILED_FATAL,
-                                    "unexpected: " + t, properties.getMaxAttempts())));
+                    RecordResult fatal = new RecordResult(id, RecordStatus.FAILED_FATAL,
+                            "unexpected: " + t, properties.getMaxAttempts());
+                    try {
+                        store.saveResult(fatal);
+                    } catch (UncheckedIOException persistFailure) {
+                        // 终态也落不了盘：保留为中断未决（已有 C 行），重启后可重提，
+                        // 绝不让调用方无限挂起，也不伪造一个未持久化的"已确认"。
+                        log.error("failed to persist terminal result for {}; marking interrupted", id, persistFailure);
+                        store.markInterrupted(id);
+                        future.complete(tally(RecordStatus.REJECTED,
+                                new RecordResult(id, RecordStatus.REJECTED,
+                                        "rejected: terminal result could not be persisted, resubmission required: "
+                                                + persistFailure.getMessage(), 0)));
+                        return;
+                    }
+                    future.complete(tally(RecordStatus.FAILED_FATAL, fatal));
                 } finally {
                     permits.release();
                 }
             });
         } catch (RuntimeException e) {
-            // 关闭过程中的竞态：执行器已停，快速拒绝。
+            // 关闭过程中的竞态：任务未开始，回滚占位、释放许可、快速拒绝。
             permits.release();
+            store.rollbackClaim(id);
             return completed(tally(RecordStatus.REJECTED,
-                    new RecordResult(id, RecordStatus.REJECTED, "engine shutting down", 0)));
+                    new RecordResult(id, RecordStatus.REJECTED, "rejected: engine shutting down", 0)));
         }
         return future;
     }
@@ -172,6 +202,28 @@ public class BatchPipelineEngine implements AutoCloseable {
 
     public long submittedCount() {
         return submitted.get();
+    }
+
+    /** 当前进程内已受理、尚未出结论的标识数（真实占用处理许可的任务数）。 */
+    public long inFlightCount() {
+        return store.inFlightCount();
+    }
+
+    /** 有"已开始处理"记录但无终态（重启回放识别出的中断未决）的标识数。 */
+    public long interruptedCount() {
+        return store.interruptedCount();
+    }
+
+    /**
+     * 只读查询某业务标识当前处于什么情况（CONFIRMED / IN_FLIGHT / INTERRUPTED / NOT_FOUND）。
+     * 不改变状态、不占用处理许可。
+     */
+    public RecordSnapshot lookup(String businessId) {
+        if (businessId == null || businessId.isBlank()) {
+            return new RecordSnapshot(businessId, SubmissionState.NOT_FOUND, null,
+                    "no submission known for blank businessId", 0);
+        }
+        return store.lookup(businessId);
     }
 
     /** 停机收敛：拒绝新提交，等待在途任务在 shutdownTimeoutMs 内完成并落盘。 */

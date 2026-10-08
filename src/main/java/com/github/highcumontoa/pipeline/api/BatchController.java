@@ -3,8 +3,10 @@ package com.github.highcumontoa.pipeline.api;
 import com.github.highcumontoa.pipeline.core.BatchPipelineEngine;
 import com.github.highcumontoa.pipeline.core.BatchRecord;
 import com.github.highcumontoa.pipeline.core.RecordResult;
+import com.github.highcumontoa.pipeline.core.RecordSnapshot;
 import com.github.highcumontoa.pipeline.core.RecordStatus;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -29,7 +31,17 @@ public class BatchController {
         return engine.submitBatch(records);
     }
 
-    /** 状态计数快照与守恒校验（sum(stats) == submitted）。 */
+    /**
+     * 只读查询单个业务标识的当前情况：
+     * CONFIRMED（含最终结论）/ IN_FLIGHT / INTERRUPTED / NOT_FOUND。
+     * 查询不改变状态，也不占用处理容量。
+     */
+    @GetMapping("/records/{businessId}")
+    public RecordSnapshot lookup(@PathVariable String businessId) {
+        return engine.lookup(businessId);
+    }
+
+    /** 状态计数快照、占用观察与守恒校验（sum(stats) == submitted）。 */
     @GetMapping("/stats")
     public Map<String, Object> stats() {
         Map<RecordStatus, Long> stats = engine.stats();
@@ -37,6 +49,8 @@ public class BatchController {
         return Map.of(
                 "stats", stats,
                 "submitted", engine.submittedCount(),
+                "inFlight", engine.inFlightCount(),
+                "interrupted", engine.interruptedCount(),
                 "conserved", sum == engine.submittedCount());
     }
 }
