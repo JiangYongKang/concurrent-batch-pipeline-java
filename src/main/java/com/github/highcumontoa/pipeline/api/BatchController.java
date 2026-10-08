@@ -4,7 +4,9 @@ import com.github.highcumontoa.pipeline.core.BatchPipelineEngine;
 import com.github.highcumontoa.pipeline.core.BatchRecord;
 import com.github.highcumontoa.pipeline.core.RecordResult;
 import com.github.highcumontoa.pipeline.core.RecordStatus;
+import com.github.highcumontoa.pipeline.core.TaskStatus;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -29,6 +31,17 @@ public class BatchController {
         return engine.submitBatch(records);
     }
 
+    /**
+     * 按业务标识只读查询任务状态。
+     *
+     * <p>state 取值：SUCCEEDED / FAILED / IN_PROGRESS / UNKNOWN。
+     * 查询不改变状态、不占用处理容量；重启后已确认结论查询结果不变。
+     */
+    @GetMapping("/status/{businessId}")
+    public TaskStatus status(@PathVariable String businessId) {
+        return engine.queryStatus(businessId);
+    }
+
     /** 状态计数快照与守恒校验（sum(stats) == submitted）。 */
     @GetMapping("/stats")
     public Map<String, Object> stats() {
@@ -37,6 +50,7 @@ public class BatchController {
         return Map.of(
                 "stats", stats,
                 "submitted", engine.submittedCount(),
+                "claimed", engine.claimedCount(),
                 "conserved", sum == engine.submittedCount());
     }
 }

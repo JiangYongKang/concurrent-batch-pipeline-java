@@ -24,6 +24,12 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>幂等模型：处理前先 tryClaim 占位，同一 businessId 只会有一个执行体进入
  * 处理逻辑；重复提交返回 DUPLICATE 并附可区分原因（已确认 / 在途）。
+ * 背压拒绝 / 关闭竞态发生在形成结论之前，会 releaseClaim 回收占位，
+ * 同一标识之后可作为新任务正常重提；已有最终结论的标识不会被回收，重提仍算重复。
+ *
+ * <p>状态查询：{@link #queryStatus(String)} 只读返回 SUCCEEDED / FAILED /
+ * IN_PROGRESS / UNKNOWN 四态，不改变状态、不占容量；最终结论落盘持久化，
+ * 重启后查询结果与重启前一致，中断时在途的标识重启后按 UNKNOWN 处理、可重新提交。
  *
  * <p>失败分类：{@link RetryableProcessingException} 按 maxAttempts 重试，
  * 耗尽后记 FAILED_RETRYABLE；{@link FatalProcessingException} 不重试，
@@ -96,6 +102,8 @@ public class BatchPipelineEngine implements AutoCloseable {
             admitted = false;
         }
         if (!admitted || closing) {
+            // 被背压挡回时尚未形成任何结论：回收占位，使同一标识稍后可作为新任务重提。
+            store.releaseClaim(id);
             return completed(tally(RecordStatus.REJECTED,
                     new RecordResult(id, RecordStatus.REJECTED,
                             "backpressure: no capacity within " + properties.getOfferTimeoutMs() + "ms", 0)));
@@ -106,16 +114,19 @@ public class BatchPipelineEngine implements AutoCloseable {
                 try {
                     future.complete(processWithRetry(record));
                 } catch (Throwable t) {
-                    future.complete(tally(RecordStatus.FAILED_FATAL,
-                            new RecordResult(id, RecordStatus.FAILED_FATAL,
-                                    "unexpected: " + t, properties.getMaxAttempts())));
+                    RecordResult fatal = new RecordResult(id, RecordStatus.FAILED_FATAL,
+                            "unexpected: " + t, properties.getMaxAttempts());
+                    // 同样落盘并清掉在途占位，避免标识永久占用、重启后状态含糊。
+                    store.saveResult(fatal);
+                    future.complete(tally(RecordStatus.FAILED_FATAL, fatal));
                 } finally {
                     permits.release();
                 }
             });
         } catch (RuntimeException e) {
-            // 关闭过程中的竞态：执行器已停，快速拒绝。
+            // 关闭过程中的竞态：执行器已停，快速拒绝；同样回收占位，允许后续重提。
             permits.release();
+            store.releaseClaim(id);
             return completed(tally(RecordStatus.REJECTED,
                     new RecordResult(id, RecordStatus.REJECTED, "engine shutting down", 0)));
         }
@@ -154,8 +165,34 @@ public class BatchPipelineEngine implements AutoCloseable {
         throw new IllegalStateException("unreachable");
     }
 
-    private RecordResult tally(RecordStatus status, RecordResult result) {
-        counters.get(status).incrementAndGet();
+    /**
+     * 按业务标识只读查询当前状态：成功 / 失败 / 处理中 / 未知（未提交或曾被背压挡回）。
+     *
+     * <p>查询不改变任何状态、不占用处理许可；已有最终结论直接读落盘恢复的结果，
+     * 因此重启前后对同一标识查到的结论一致。
+     */
+    public TaskStatus queryStatus(String businessId) {
+        if (businessId == null || businessId.isBlank()) {
+            return new TaskStatus(businessId, TaskState.UNKNOWN, null, null, 0);
+        }
+        Optional<RecordResult> terminal = store.find(businessId);
+        if (terminal.isPresent()) {
+            RecordResult r = terminal.get();
+            TaskState state = r.status() == RecordStatus.PROCESSED ? TaskState.SUCCEEDED : TaskState.FAILED;
+            return new TaskStatus(businessId, state, r.status(), r.reason(), r.attempts());
+        }
+        if (store.isInFlight(businessId)) {
+            return new TaskStatus(businessId, TaskState.IN_PROGRESS, null, null, 0);
+        }
+        return new TaskStatus(businessId, TaskState.UNKNOWN, null, null, 0);
+    }
+
+    /** 系统内部为提交保留的标识占用数（在途占位 + 已确认结论），用于观测拒绝回收是否彻底。 */
+    public long claimedCount() {
+        return store.claimedCount();
+    }
+
+    private RecordResult tally(RecordStatus status, RecordResult result) {        counters.get(status).incrementAndGet();
         return result;
     }
 
